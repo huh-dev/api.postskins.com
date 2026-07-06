@@ -41,6 +41,7 @@ return [
         'redirect' => env('STEAM_REDIRECT_URI'),
         'force_https' => env('STEAM_FORCE_HTTPS', false),
         'allowed_hosts' => array_filter(explode(',', env('STEAM_ALLOWED_HOSTS', ''))),
+        'frontend_url' => env('FRONTEND_URL', 'http://localhost:3000'),
     ],
 
 ];
