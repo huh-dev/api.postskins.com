@@ -11,7 +11,11 @@
     "require": {
         "php": "^8.3",
         "laravel/framework": "^13.8",
-        "laravel/tinker": "^3.0"
+        "laravel/sanctum": "^4.0",
+        "laravel/socialite": "^5.24",
+        "laravel/tinker": "^3.0",
+        "socialiteproviders/manager": "^4.8",
+        "socialiteproviders/steam": "^4.3"
     },
     "require-dev": {
         "fakerphp/faker": "^1.23",
@@ -74,7 +78,10 @@
     },
     "extra": {
         "laravel": {
-            "dont-discover": []
+            "dont-discover": [
+                "laravel/socialite",
+                "socialiteproviders/manager"
+            ]
         }
     },
     "config": {

@@ -35,4 +35,12 @@ return [
         ],
     ],
 
+    'steam' => [
+        'client_id' => null,
+        'client_secret' => env('STEAM_CLIENT_SECRET'),
+        'redirect' => env('STEAM_REDIRECT_URI'),
+        'force_https' => env('STEAM_FORCE_HTTPS', false),
+        'allowed_hosts' => array_filter(explode(',', env('STEAM_ALLOWED_HOSTS', ''))),
+    ],
+
 ];
