@@ -44,4 +44,9 @@ return [
         'frontend_url' => env('FRONTEND_URL', 'http://localhost:3000'),
     ],
 
+    'steamapis' => [
+        'key' => env('STEAMAPIS_KEY'),
+        'base_url' => env('STEAMAPIS_BASE_URL', 'https://api.steamapis.com/v2'),
+    ],
+
 ];
