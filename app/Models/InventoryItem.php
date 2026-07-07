@@ -3,12 +3,15 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 #[Fillable(['user_id', 'steam_id', 'app_id', 'context_id', 'asset_id', 'item_description_id', 'amount', 'tradable', 'tradable_after', 'first_seen_at', 'last_seen_at'])]
 class InventoryItem extends Model
 {
+    use HasFactory;
+
     /**
      * The shared metadata for this asset.
      *

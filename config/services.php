@@ -49,4 +49,10 @@ return [
         'base_url' => env('STEAMAPIS_BASE_URL', 'https://api.steamapis.com/v2'),
     ],
 
+    'steam_inventory' => [
+        // Which inventory source to use: "steamapis" (proxied, production) or
+        // "official" (free, rate-limited, good for local development).
+        'driver' => env('STEAM_INVENTORY_DRIVER', 'steamapis'),
+    ],
+
 ];

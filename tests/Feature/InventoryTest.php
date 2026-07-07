@@ -181,3 +181,42 @@ test('a user without a linked steam account is rejected', function () {
 test('the inventory route requires authentication', function () {
     $this->getJson(route('inventory.index'))->assertUnauthorized();
 });
+
+test('the official driver pages through the steam community endpoint and merges results', function () {
+    config()->set('services.steam_inventory.driver', 'official');
+
+    $pageOne = fakeInventoryPayload();
+    $pageOne['more_items'] = 1;
+    $pageOne['last_assetid'] = '111';
+
+    // Second page carries a different asset that reuses the same description.
+    $pageTwo = fakeInventoryPayload();
+    $pageTwo['assets'][0]['assetid'] = '999';
+    $pageTwo['more_items'] = 0;
+
+    Http::fake([
+        'steamcommunity.com/*' => Http::sequence()->push($pageOne)->push($pageTwo),
+    ]);
+
+    $this->actingAs(steamUser())
+        ->getJson(route('inventory.index'))
+        ->assertOk()
+        ->assertJsonPath('count', 2)
+        ->assertJsonPath('items.0.name', 'AK-47 | Redline');
+
+    Http::assertSentCount(2);
+    expect(collect(Http::recorded())->last()[0]->url())->toContain('start_assetid=111');
+});
+
+test('the official driver reports a private inventory as 409', function () {
+    config()->set('services.steam_inventory.driver', 'official');
+
+    Http::fake([
+        'steamcommunity.com/*' => Http::response(['success' => false, 'Error' => 'This profile is private.'], 403),
+    ]);
+
+    $this->actingAs(steamUser())
+        ->getJson(route('inventory.index'))
+        ->assertStatus(409)
+        ->assertJsonPath('code', 'inventory_private');
+});

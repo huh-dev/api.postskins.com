@@ -26,6 +26,7 @@ class InventoryItemResource extends JsonResource
         $description = $this->itemDescription;
 
         return [
+            'id' => $this->id,
             'asset_id' => $this->asset_id,
             'class_id' => $description->classid,
             'instance_id' => $description->instanceid,
