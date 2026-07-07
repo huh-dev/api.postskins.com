@@ -5,6 +5,7 @@ use App\Http\Controllers\Dev\TradeLabController;
 use App\Http\Controllers\InventoryController;
 use App\Http\Controllers\ListingController;
 use App\Http\Controllers\ProfileController;
+use App\Http\Controllers\SellerController;
 use App\Http\Controllers\TradeController;
 use App\Http\Controllers\WalletController;
 use Illuminate\Http\Request;
@@ -21,6 +22,11 @@ Route::get('/inventory', [InventoryController::class, 'index'])
 Route::middleware('auth:sanctum')->group(function () {
     Route::get('/wallet', [WalletController::class, 'show'])->name('wallet.show');
     Route::put('/user/trade-url', [ProfileController::class, 'updateTradeUrl'])->name('user.trade-url');
+
+    Route::get('/seller/status', [SellerController::class, 'status'])->name('seller.status');
+    Route::post('/seller/connect', [SellerController::class, 'startConnect'])->name('seller.connect');
+    Route::get('/seller/connect/{id}', [SellerController::class, 'connectStatus'])->name('seller.connect.status');
+    Route::delete('/seller/connect', [SellerController::class, 'disconnect'])->name('seller.disconnect');
 
     Route::get('/listings', [ListingController::class, 'index'])->name('listings.index');
     Route::get('/listings/mine', [ListingController::class, 'mine'])->name('listings.mine');

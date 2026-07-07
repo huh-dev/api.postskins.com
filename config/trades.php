@@ -56,6 +56,10 @@ return [
     'poll' => [
         'min_seconds' => (int) env('TRADE_POLL_MIN_SECONDS', 60),
         'max_seconds' => (int) env('TRADE_POLL_MAX_SECONDS', 3600),
+        // How often to re-check an accepted trade for a rollback during the
+        // protection window. Each check uses the seller's Steam session, so keep
+        // this well above a minute in production to avoid login rate limits.
+        'reversal_seconds' => (int) env('TRADE_REVERSAL_POLL_SECONDS', 900),
     ],
 
     /*

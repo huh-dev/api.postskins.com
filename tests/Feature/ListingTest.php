@@ -5,17 +5,22 @@ use App\Models\ItemDescription;
 use App\Models\Listing;
 use App\Models\User;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Http;
 
 uses(RefreshDatabase::class);
 
 /**
- * A seller who owns one tradable item.
+ * A seller who owns one tradable item and is connected for selling.
  *
  * @return array{seller: User, item: InventoryItem}
  */
-function sellerOwning(bool $tradable = true): array
+function sellerOwning(bool $tradable = true, bool $connected = true): array
 {
-    $seller = User::factory()->create(['steam_id' => fake()->unique()->numerify('7656119#########')]);
+    $seller = User::factory()->create([
+        'steam_id' => fake()->unique()->numerify('7656119#########'),
+        'steam_refresh_token' => $connected ? 'seller-refresh-token' : null,
+        'steam_selling_connected_at' => $connected ? now() : null,
+    ]);
     $description = ItemDescription::factory()->create();
     $item = InventoryItem::factory()->for($seller)->create([
         'item_description_id' => $description->id,
@@ -86,7 +91,9 @@ test('a seller can cancel their own listing', function () {
     $this->assertDatabaseHas('listings', ['id' => $listing->id, 'status' => 'cancelled']);
 });
 
-test('buying a listing holds funds, opens a trade, and marks it sold', function () {
+test('buying a listing holds funds, opens a trade, auto-sends the offer, and marks it sold', function () {
+    Http::fake(['*' => Http::response(['ok' => true, 'tradeOfferId' => '99887766', 'state' => 'needs_confirmation'])]);
+
     ['item' => $item] = sellerOwning();
     $listing = Listing::factory()->forItem($item)->create(['price' => 2_500]);
     $buyer = funded();
@@ -99,7 +106,17 @@ test('buying a listing holds funds, opens a trade, and marks it sold', function 
 
     expect($buyer->ensureWallet()->fresh()->balance)->toBe(7_500);
     $this->assertDatabaseHas('listings', ['id' => $listing->id, 'status' => 'sold']);
-    $this->assertDatabaseHas('trades', ['buyer_id' => $buyer->id, 'seller_id' => $listing->seller_id]);
+    // The send job ran (sync queue) and recorded the Steam offer id.
+    $this->assertDatabaseHas('trades', ['buyer_id' => $buyer->id, 'seller_id' => $listing->seller_id, 'steam_tradeoffer_id' => '99887766']);
+});
+
+test('listing requires the seller to be connected for selling', function () {
+    ['seller' => $seller, 'item' => $item] = sellerOwning(connected: false);
+
+    $this->actingAs($seller)
+        ->postJson(route('listings.store'), ['inventory_item_id' => $item->id, 'price' => 3_000])
+        ->assertStatus(422)
+        ->assertJsonPath('code', 'connect_steam_required');
 });
 
 test('you cannot buy your own listing', function () {

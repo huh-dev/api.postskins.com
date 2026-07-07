@@ -12,7 +12,7 @@ use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
 
 #[Fillable(['name', 'email', 'password', 'steam_id', 'avatar', 'trade_url', 'suspended_at', 'suspension_reason'])]
-#[Hidden(['password', 'remember_token'])]
+#[Hidden(['password', 'remember_token', 'steam_refresh_token'])]
 class User extends Authenticatable
 {
     /** @use HasFactory<UserFactory> */
@@ -47,6 +47,14 @@ class User extends Authenticatable
     }
 
     /**
+     * Whether the seller has authorized the GC service to send trades for them.
+     */
+    public function isSellingConnected(): bool
+    {
+        return $this->steam_refresh_token !== null;
+    }
+
+    /**
      * Get the attributes that should be cast.
      *
      * @return array<string, string>
@@ -57,6 +65,8 @@ class User extends Authenticatable
             'email_verified_at' => 'datetime',
             'password' => 'hashed',
             'suspended_at' => 'datetime',
+            'steam_refresh_token' => 'encrypted',
+            'steam_selling_connected_at' => 'datetime',
         ];
     }
 }

@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Enums\ListingStatus;
 use App\Http\Resources\ListingResource;
 use App\Http\Resources\TradeResource;
+use App\Jobs\SendTradeOffer;
 use App\Models\InventoryItem;
 use App\Models\Listing;
 use App\Services\Trading\TradeService;
@@ -53,6 +54,14 @@ class ListingController extends Controller
         ]);
 
         $seller = $request->user();
+
+        if (! $seller->isSellingConnected()) {
+            return response()->json([
+                'message' => 'Connect your Steam account for selling before listing items.',
+                'code' => 'connect_steam_required',
+            ], 422);
+        }
+
         $item = InventoryItem::with('itemDescription')
             ->where('id', $validated['inventory_item_id'])
             ->where('user_id', $seller->id)
@@ -144,6 +153,10 @@ class ListingController extends Controller
 
         $trade = $this->trades->open($buyer, $item, $listing->price);
         $listing->update(['status' => ListingStatus::Sold]);
+
+        // Automatically send the seller's item to the buyer via the GC service;
+        // the seller then only confirms the outgoing offer on their mobile app.
+        SendTradeOffer::dispatch($trade->id);
 
         $trade->load(['seller', 'buyer', 'itemDescription', 'events']);
 

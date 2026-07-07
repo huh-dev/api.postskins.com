@@ -55,4 +55,10 @@ return [
         'driver' => env('STEAM_INVENTORY_DRIVER', 'steamapis'),
     ],
 
+    // The Node "GC" service that sends P2P trade offers on a seller's behalf.
+    'gc' => [
+        'url' => env('GC_URL', 'http://localhost:3100'),
+        'secret' => env('GC_SHARED_SECRET'),
+    ],
+
 ];
