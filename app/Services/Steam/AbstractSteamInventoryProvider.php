@@ -60,18 +60,26 @@ abstract class AbstractSteamInventoryProvider implements InventoryProvider
     /**
      * Determine whether the upstream response represents a private inventory.
      *
-     * Steam returns HTTP 403 for private profiles; aggregators sometimes proxy
-     * that as a body-level error instead, so we check both.
+     * Steam returns HTTP 403 for private profiles, but also for rate limits and
+     * third-party quota errors — so we key off the error text, not the status.
      */
     protected function indicatesPrivateInventory(Response $response): bool
     {
-        if ($response->status() === 403) {
-            return true;
+        $error = strtolower($this->upstreamErrorMessage($response) ?? '');
+
+        if ($error === '') {
+            return false;
         }
 
-        $error = strtolower((string) ($response->json('Error') ?? $response->json('error') ?? ''));
+        return str_contains($error, 'private')
+            || str_contains($error, 'inventory is not available');
+    }
 
-        return str_contains($error, 'private');
+    protected function upstreamErrorMessage(Response $response): ?string
+    {
+        $error = $response->json('Error') ?? $response->json('error') ?? $response->json('message');
+
+        return is_string($error) && $error !== '' ? $error : null;
     }
 
     /**

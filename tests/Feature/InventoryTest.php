@@ -88,6 +88,86 @@ test('a private inventory returns a 409 with an actionable code', function () {
         ->assertJsonPath('code', 'inventory_private');
 });
 
+test('a steamapis quota error falls back to the official steam endpoint', function () {
+    config()->set('services.steam_inventory.driver', 'steamapis');
+
+    Http::fake([
+        'api.steamapis.com/*' => Http::response([
+            'error' => 'API key disabled: plan request limit reached.',
+        ], 403),
+        'steamcommunity.com/*' => Http::response(fakeInventoryPayload()),
+    ]);
+
+    $this->actingAs(steamUser())
+        ->getJson(route('inventory.index'))
+        ->assertOk()
+        ->assertJsonPath('count', 1);
+});
+
+test('a steamapis quota error is not treated as a private inventory', function () {
+    config()->set('services.steam_inventory.driver', 'steamapis');
+
+    // Both sources 403: SteamAPIs on quota, Steam on a genuinely private profile.
+    Http::fake([
+        'api.steamapis.com/*' => Http::response([
+            'error' => 'API key disabled: plan request limit reached.',
+        ], 403),
+        'steamcommunity.com/*' => Http::response('quota', 429),
+    ]);
+
+    $this->actingAs(steamUser())
+        ->getJson(route('inventory.index'))
+        ->assertStatus(502)
+        ->assertJsonPath('code', 'inventory_unavailable');
+});
+
+test('when both providers fail the 502 surfaces each provider error', function () {
+    config()->set('services.steam_inventory.driver', 'steamapis');
+
+    Http::fake([
+        'api.steamapis.com/*' => Http::response([
+            'error' => 'API key disabled: plan request limit reached.',
+        ], 403),
+        'steamcommunity.com/*' => Http::response('down', 500),
+    ]);
+
+    $response = $this->actingAs(steamUser())
+        ->getJson(route('inventory.index'))
+        ->assertStatus(502)
+        ->assertJsonPath('code', 'inventory_unavailable');
+
+    expect($response->json('message'))
+        ->toContain('API key disabled: plan request limit reached.')
+        ->toContain('Steam returned HTTP 500.');
+});
+
+test('a stale fallback surfaces the combined provider error alongside the items', function () {
+    config()->set('services.steam_inventory.driver', 'steamapis');
+
+    $user = steamUser();
+
+    // First SteamAPIs call seeds stored items; the second (after fresh=1) fails,
+    // and the official fallback fails too, so we serve the last known inventory.
+    Http::fake([
+        'api.steamapis.com/*' => Http::sequence()
+            ->push(fakeInventoryPayload())
+            ->push(['error' => 'plan request limit reached.'], 403),
+        'steamcommunity.com/*' => Http::response('down', 500),
+    ]);
+
+    $this->actingAs($user)->getJson(route('inventory.index'))->assertOk();
+
+    $response = $this->actingAs($user)
+        ->getJson(route('inventory.index', ['fresh' => 1]))
+        ->assertOk()
+        ->assertJsonPath('stale', true)
+        ->assertJsonPath('count', 1);
+
+    expect($response->json('error'))
+        ->toContain('plan request limit reached.')
+        ->toContain('Steam returned HTTP 500.');
+});
+
 test('an upstream failure with no stored items returns a 502 and is not throttled', function () {
     Http::fake(['*' => Http::response('down', 500)]);
 
@@ -158,6 +238,7 @@ test('a transient upstream failure falls back to the last known inventory', func
 
     Http::fakeSequence()
         ->push(fakeInventoryPayload())
+        ->push('down', 500)
         ->push('down', 500);
 
     $this->actingAs($user)->getJson(route('inventory.index'))->assertOk();

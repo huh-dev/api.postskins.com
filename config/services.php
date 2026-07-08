@@ -51,7 +51,9 @@ return [
 
     'steam_inventory' => [
         // Which inventory source to use: "steamapis" (proxied, production) or
-        // "official" (free, rate-limited, good for local development).
+        // "official" (free, rate-limited, good for local development). When set
+        // to "steamapis", the official endpoint is used as an automatic fallback
+        // if SteamAPIs errors (e.g. quota exhausted).
         'driver' => env('STEAM_INVENTORY_DRIVER', 'steamapis'),
     ],
 

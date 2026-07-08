@@ -6,11 +6,14 @@ use App\Http\Resources\InventoryItemResource;
 use App\Models\InventoryItem;
 use App\Models\User;
 use App\Services\Steam\InventoryProvider;
+use App\Services\Steam\InventoryResult;
+use App\Services\Steam\OfficialSteamInventoryProvider;
 use App\Services\SteamInventorySync;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
 
 class InventoryController extends Controller
 {
@@ -53,7 +56,7 @@ class InventoryController extends Controller
             return $this->inventoryResponse($appId, $contextId, $this->storedItems($user, $appId, $contextId));
         }
 
-        $result = $this->provider->fetch($user->steam_id, $appId, $contextId);
+        $result = $this->fetchInventory($user->steam_id, $appId, $contextId);
 
         return match ($result->status) {
             'ok' => tap(
@@ -65,8 +68,45 @@ class InventoryController extends Controller
                 'code' => 'inventory_private',
             ], 409),
             // On a transient upstream failure, fall back to the last known inventory.
-            default => $this->fallbackOrError($user, $appId, $contextId),
+            default => $this->fallbackOrError($user, $appId, $contextId, $result->message),
         };
+    }
+
+    /**
+     * Fetch from the configured provider, falling back to Steam's public
+     * endpoint when SteamAPIs errors (e.g. quota exhausted). If both sources
+     * fail, the returned result carries each provider's error message.
+     */
+    private function fetchInventory(string $steamId, int $appId, int $contextId): InventoryResult
+    {
+        $result = $this->provider->fetch($steamId, $appId, $contextId);
+
+        // Only the SteamAPIs driver has a secondary source to fall back on.
+        if ($result->status !== 'error' || config('services.steam_inventory.driver') !== 'steamapis') {
+            return $result;
+        }
+
+        $fallback = app(OfficialSteamInventoryProvider::class)->fetch($steamId, $appId, $contextId);
+
+        if ($fallback->status !== 'error') {
+            return $fallback;
+        }
+
+        // Both sources failed — log and surface each provider's error so the
+        // underlying cause (quota, rate limit, outage…) is visible.
+        Log::warning('Both inventory providers failed.', [
+            'steam_id' => $steamId,
+            'app_id' => $appId,
+            'context_id' => $contextId,
+            'steamapis_error' => $result->message,
+            'official_error' => $fallback->message,
+        ]);
+
+        return InventoryResult::error(sprintf(
+            'SteamAPIs: %s — Steam: %s',
+            $result->message ?? 'unknown error',
+            $fallback->message ?? 'unknown error',
+        ));
     }
 
     /**
@@ -88,15 +128,18 @@ class InventoryController extends Controller
     /**
      * Return stored items when Steam is unreachable, or a 502 if we have none.
      */
-    private function fallbackOrError(User $user, int $appId, int $contextId): JsonResponse
+    private function fallbackOrError(User $user, int $appId, int $contextId, ?string $upstreamMessage = null): JsonResponse
     {
         $stored = $this->storedItems($user, $appId, $contextId);
 
         if ($stored->isNotEmpty()) {
-            return $this->inventoryResponse($appId, $contextId, $stored, stale: true);
+            return $this->inventoryResponse($appId, $contextId, $stored, stale: true, error: $upstreamMessage);
         }
 
-        return response()->json(['message' => 'Unable to load inventory from Steam.'], 502);
+        return response()->json([
+            'message' => $upstreamMessage ?? 'Unable to load inventory from Steam.',
+            'code' => 'inventory_unavailable',
+        ], 502);
     }
 
     /**
@@ -104,13 +147,14 @@ class InventoryController extends Controller
      *
      * @param  Collection<int, InventoryItem>  $items
      */
-    private function inventoryResponse(int $appId, int $contextId, Collection $items, bool $stale = false): JsonResponse
+    private function inventoryResponse(int $appId, int $contextId, Collection $items, bool $stale = false, ?string $error = null): JsonResponse
     {
         return response()->json([
             'app_id' => $appId,
             'context_id' => $contextId,
             'count' => $items->count(),
             'stale' => $stale,
+            'error' => $error,
             'items' => InventoryItemResource::collection($items),
         ]);
     }

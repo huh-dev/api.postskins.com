@@ -20,7 +20,7 @@ class SteamApisInventoryProvider extends AbstractSteamInventoryProvider
                 config('services.steamapis.base_url')."/steam/users/{$steamId}/inventory/{$appId}/{$contextId}"
             );
         } catch (ConnectionException) {
-            return InventoryResult::error();
+            return InventoryResult::error('Unable to reach the inventory provider.');
         }
 
         if ($this->indicatesPrivateInventory($response)) {
@@ -28,7 +28,8 @@ class SteamApisInventoryProvider extends AbstractSteamInventoryProvider
         }
 
         if ($response->failed()) {
-            return InventoryResult::error();
+            return InventoryResult::error($this->upstreamErrorMessage($response)
+                ?? "SteamAPIs returned HTTP {$response->status()}.");
         }
 
         return InventoryResult::ok(

@@ -9,7 +9,8 @@ use Illuminate\Support\Facades\Http;
  * Fetches inventories directly from the public Steam Community endpoint.
  *
  * Free and key-less, but rate-limited per IP — suitable for local development
- * or low volume. Large inventories are paged via `more_items` + `last_assetid`.
+ * or as a fallback when SteamAPIs is unavailable. Large inventories are paged
+ * via `more_items` + `last_assetid`.
  */
 class OfficialSteamInventoryProvider extends AbstractSteamInventoryProvider
 {
@@ -42,7 +43,7 @@ class OfficialSteamInventoryProvider extends AbstractSteamInventoryProvider
                     ]),
                 );
             } catch (ConnectionException) {
-                return InventoryResult::error();
+                return InventoryResult::error('Unable to reach Steam.');
             }
 
             if ($this->indicatesPrivateInventory($response)) {
@@ -50,7 +51,8 @@ class OfficialSteamInventoryProvider extends AbstractSteamInventoryProvider
             }
 
             if ($response->failed()) {
-                return InventoryResult::error();
+                return InventoryResult::error($this->upstreamErrorMessage($response)
+                    ?? "Steam returned HTTP {$response->status()}.");
             }
 
             $assets = array_merge($assets, $response->json('assets', []));

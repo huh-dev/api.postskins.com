@@ -14,6 +14,7 @@ final class InventoryResult
     private function __construct(
         public readonly string $status,
         public readonly array $items = [],
+        public readonly ?string $message = null,
     ) {}
 
     /**
@@ -29,8 +30,8 @@ final class InventoryResult
         return new self('private');
     }
 
-    public static function error(): self
+    public static function error(?string $message = null): self
     {
-        return new self('error');
+        return new self('error', message: $message);
     }
 }
