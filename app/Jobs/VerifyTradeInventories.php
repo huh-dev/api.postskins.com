@@ -2,7 +2,6 @@
 
 namespace App\Jobs;
 
-use App\Enums\TradeStatus;
 use App\Models\Trade;
 use App\Models\User;
 use App\Services\Steam\InventoryProvider;
@@ -10,18 +9,15 @@ use App\Services\SteamInventorySync;
 use App\Services\Trading\TradeVerifier;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Support\Facades\Log;
 
 /**
- * Watches an accepted trade for a rollback during the protection window using
- * only the parties' PUBLIC inventories — no session/token, so a party who
- * reverses (and never returns) cannot prevent detection. A rollback returns a
- * sent asset to its giver or removes a received copy from its receiver.
- *
- * A swap touches both parties' inventories, so every distinct giver and receiver
- * is read once and the outcome (clean or not) is handed to the verifier, which
- * only advances the trade on a clean read.
+ * Fallback verification for a trade with no Steam offer id to track (lab or
+ * manual delivery). Reads every party's inventory once; a two-sided swap touches
+ * two inventories, so both must read cleanly before the verifier runs. A
+ * failed/private read is never used to advance a trade — we back off and retry.
  */
-class VerifyAcceptedTrade implements ShouldQueue
+class VerifyTradeInventories implements ShouldQueue
 {
     use Queueable;
 
@@ -31,7 +27,7 @@ class VerifyAcceptedTrade implements ShouldQueue
     {
         $trade = Trade::with('items')->find($this->tradeId);
 
-        if ($trade === null || $trade->status !== TradeStatus::Accepted) {
+        if ($trade === null || ! $trade->status->isActive()) {
             return;
         }
 
@@ -39,18 +35,18 @@ class VerifyAcceptedTrade implements ShouldQueue
             ->flatMap(fn ($leg): array => [(int) $leg->giver_id, (int) $leg->receiver_id])
             ->unique();
 
-        $readOk = [];
         foreach (User::query()->whereKey($userIds)->get() as $user) {
-            $readOk[$user->id] = $this->refreshInventory($provider, $sync, $user, $trade->app_id, $trade->context_id);
+            if (! $this->refreshInventory($provider, $sync, $user, $trade->app_id, $trade->context_id)) {
+                Log::info('VerifyTradeInventories: read not clean, backing off', ['trade_id' => $trade->id, 'user_id' => $user->id]);
+                $this->backOff($trade);
+
+                return;
+            }
         }
 
-        $verifier->reviewAcceptedTrade($trade, $readOk);
+        $verifier->verify($trade);
     }
 
-    /**
-     * Fetch + persist a user's public inventory. Returns whether the read was
-     * clean — only a clean read may advance the trade.
-     */
     private function refreshInventory(InventoryProvider $provider, SteamInventorySync $sync, User $user, int $appId, int $contextId): bool
     {
         if ($user->steam_id === null) {
@@ -66,5 +62,13 @@ class VerifyAcceptedTrade implements ShouldQueue
         $sync->sync($user, $appId, $contextId, $result->items);
 
         return true;
+    }
+
+    private function backOff(Trade $trade): void
+    {
+        $trade->forceFill([
+            'next_poll_at' => now()->addSeconds((int) config('trades.poll.min_seconds')),
+            'last_polled_at' => now(),
+        ])->save();
     }
 }

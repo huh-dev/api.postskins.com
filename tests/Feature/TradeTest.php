@@ -1,126 +1,203 @@
 <?php
 
-use App\Models\InventoryItem;
+use App\Enums\TradeOfferStatus;
+use App\Enums\TradePostStatus;
+use App\Jobs\SendTradeOffer;
 use App\Models\ItemDescription;
+use App\Models\Trade;
+use App\Models\TradeOffer;
+use App\Models\TradePost;
 use App\Models\User;
-use App\Services\Trading\TradeService;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Queue;
 
 uses(RefreshDatabase::class);
 
-/**
- * A seller who owns one listed, tradable item.
- *
- * @return array{seller: User, item: InventoryItem}
- */
-function sellerWithItem(): array
-{
-    $seller = User::factory()->create(['steam_id' => '76561199000000020']);
-    $description = ItemDescription::factory()->create();
-    $item = InventoryItem::factory()->for($seller)->create([
-        'item_description_id' => $description->id,
-        'tradable' => true,
-    ]);
+test('creating a post requires a connected Steam account', function () {
+    $user = tradeUrlUser('76561199000000200');
+    $item = ownedItem($user, 'AK-47 | Redline (Field-Tested)');
 
-    return ['seller' => $seller, 'item' => $item];
-}
-
-function buyerWithBalance(int $balance = 10_000): User
-{
-    $buyer = User::factory()->create([
-        'steam_id' => '76561199000000021',
-        'trade_url' => 'https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc',
-    ]);
-    $buyer->ensureWallet()->forceFill(['balance' => $balance])->save();
-
-    return $buyer;
-}
-
-test('buying an item holds the buyer funds and creates a pending trade', function () {
-    ['item' => $item] = sellerWithItem();
-    $buyer = buyerWithBalance();
-
-    $this->actingAs($buyer)
-        ->postJson(route('trades.store'), ['inventory_item_id' => $item->id, 'price' => 2_500])
-        ->assertCreated()
-        ->assertJsonPath('trade.status', 'pending_delivery')
-        ->assertJsonPath('trade.price', 2_500);
-
-    expect($buyer->ensureWallet()->fresh()->balance)->toBe(7_500);
-    $this->assertDatabaseHas('trades', ['buyer_id' => $buyer->id, 'status' => 'pending_delivery']);
-});
-
-test('you cannot buy your own item', function () {
-    ['seller' => $seller, 'item' => $item] = sellerWithItem();
-    $seller->update(['trade_url' => 'https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc']);
-    $seller->ensureWallet()->forceFill(['balance' => 10_000])->save();
-
-    $this->actingAs($seller)
-        ->postJson(route('trades.store'), ['inventory_item_id' => $item->id, 'price' => 2_500])
+    $this->actingAs($user)
+        ->postJson(route('posts.store'), [
+            'offering' => [['inventory_item_id' => $item->id]],
+            'want_cash' => 5000,
+        ])
         ->assertStatus(422)
-        ->assertJsonPath('code', 'own_item');
+        ->assertJsonPath('code', 'connect_steam_required');
 });
 
-test('buying without a trade url is rejected', function () {
-    ['item' => $item] = sellerWithItem();
-    $buyer = buyerWithBalance();
-    $buyer->update(['trade_url' => null]);
+test('a connected user can create a trade post', function () {
+    $owner = connectedUser('76561199000000201');
+    $item = ownedItem($owner, 'AWP | Dragon Lore (Factory New)');
+    $wanted = ItemDescription::factory()->create(['market_hash_name' => 'AK-47 | Redline (Field-Tested)']);
 
-    $this->actingAs($buyer)
-        ->postJson(route('trades.store'), ['inventory_item_id' => $item->id, 'price' => 2_500])
+    $this->actingAs($owner)
+        ->postJson(route('posts.store'), [
+            'offering' => [['inventory_item_id' => $item->id]],
+            'wanting' => [['item_description_id' => $wanted->id]],
+            'offer_cash' => 0,
+            'want_cash' => 5000,
+        ])
+        ->assertCreated()
+        ->assertJsonPath('post.status', 'open')
+        ->assertJsonPath('post.want_cash', 5000)
+        ->assertJsonCount(1, 'post.offering')
+        ->assertJsonCount(1, 'post.wanting');
+});
+
+test('a post cannot offer an item the user does not own', function () {
+    $owner = connectedUser('76561199000000202');
+    $stranger = tradeUrlUser('76561199000000203');
+    $othersItem = ownedItem($stranger, 'AK-47 | Redline (Field-Tested)');
+
+    $this->actingAs($owner)
+        ->postJson(route('posts.store'), [
+            'offering' => [['inventory_item_id' => $othersItem->id]],
+            'want_cash' => 5000,
+        ])
+        ->assertStatus(422);
+});
+
+test('submitting an offer requires a trade URL', function () {
+    $owner = connectedUser('76561199000000210');
+    $item = ownedItem($owner, 'AWP | Dragon Lore (Factory New)');
+    $post = TradePost::factory()->offering($item)->sellingFor(5000)->create();
+
+    $offerer = User::factory()->create(['steam_id' => '76561199000000211', 'trade_url' => null]);
+
+    $this->actingAs($offerer)
+        ->postJson(route('posts.offers.store', $post), ['cash_amount' => 5000, 'cash_payer' => 'offerer'])
         ->assertStatus(422)
         ->assertJsonPath('code', 'trade_url_required');
 });
 
-test('buying with insufficient balance is rejected', function () {
-    ['item' => $item] = sellerWithItem();
-    $buyer = buyerWithBalance(1_000);
+test('a user cannot offer on their own post', function () {
+    $owner = connectedUser('76561199000000212');
+    $item = ownedItem($owner, 'AWP | Dragon Lore (Factory New)');
+    $post = TradePost::factory()->offering($item)->sellingFor(5000)->create();
 
-    $this->actingAs($buyer)
-        ->postJson(route('trades.store'), ['inventory_item_id' => $item->id, 'price' => 2_500])
+    $this->actingAs($owner)
+        ->postJson(route('posts.offers.store', $post), ['cash_amount' => 5000, 'cash_payer' => 'offerer'])
+        ->assertStatus(422)
+        ->assertJsonPath('code', 'own_post');
+});
+
+test('a cash offer is created against a post', function () {
+    $owner = connectedUser('76561199000000213');
+    $item = ownedItem($owner, 'AWP | Dragon Lore (Factory New)');
+    $post = TradePost::factory()->offering($item)->sellingFor(5000)->create();
+
+    $offerer = tradeUrlUser('76561199000000214', 5000);
+
+    $this->actingAs($offerer)
+        ->postJson(route('posts.offers.store', $post), ['cash_amount' => 5000, 'cash_payer' => 'offerer'])
+        ->assertCreated()
+        ->assertJsonPath('offer.status', 'pending')
+        ->assertJsonPath('offer.cash_amount', 5000);
+});
+
+test('accepting an offer executes the trade and sends the Steam offer', function () {
+    Queue::fake();
+
+    $owner = connectedUser('76561199000000220');
+    $item = ownedItem($owner, 'AWP | Dragon Lore (Factory New)');
+    $post = TradePost::factory()->offering($item)->sellingFor(5000)->create();
+
+    $offerer = tradeUrlUser('76561199000000221', 5000);
+    $offer = TradeOffer::factory()->on($post)->payingCash(5000)->create(['offerer_id' => $offerer->id]);
+
+    $this->actingAs($owner)
+        ->postJson(route('offers.accept', $offer))
+        ->assertCreated()
+        ->assertJsonPath('trade.status', 'pending_delivery');
+
+    expect($post->fresh()->status)->toBe(TradePostStatus::Fulfilled)
+        ->and($offer->fresh()->status)->toBe(TradeOfferStatus::Accepted);
+
+    Queue::assertPushed(SendTradeOffer::class);
+});
+
+test('accepting one offer declines the siblings on the same post', function () {
+    Queue::fake();
+
+    $owner = connectedUser('76561199000000230');
+    $item = ownedItem($owner, 'AWP | Dragon Lore (Factory New)');
+    $post = TradePost::factory()->offering($item)->sellingFor(5000)->create();
+
+    $a = tradeUrlUser('76561199000000231', 5000);
+    $b = tradeUrlUser('76561199000000232', 5000);
+    $offerA = TradeOffer::factory()->on($post)->payingCash(5000)->create(['offerer_id' => $a->id]);
+    $offerB = TradeOffer::factory()->on($post)->payingCash(5000)->create(['offerer_id' => $b->id]);
+
+    $this->actingAs($owner)->postJson(route('offers.accept', $offerA))->assertCreated();
+
+    expect($offerB->fresh()->status)->toBe(TradeOfferStatus::Declined);
+});
+
+test('a second accept on the same post is rejected and makes only one trade', function () {
+    Queue::fake();
+
+    $owner = connectedUser('76561199000000240');
+    $item = ownedItem($owner, 'AWP | Dragon Lore (Factory New)');
+    $post = TradePost::factory()->offering($item)->sellingFor(5000)->create();
+
+    $a = tradeUrlUser('76561199000000241', 5000);
+    $b = tradeUrlUser('76561199000000242', 5000);
+    $offerA = TradeOffer::factory()->on($post)->payingCash(5000)->create(['offerer_id' => $a->id]);
+    $offerB = TradeOffer::factory()->on($post)->payingCash(5000)->create(['offerer_id' => $b->id]);
+
+    $this->actingAs($owner)->postJson(route('offers.accept', $offerA))->assertCreated();
+    $this->actingAs($owner)->postJson(route('offers.accept', $offerB))
+        ->assertStatus(409)
+        ->assertJsonPath('code', 'post_unavailable');
+
+    expect(Trade::count())->toBe(1);
+});
+
+test('accepting fails when the paying party has too little balance', function () {
+    Queue::fake();
+
+    $owner = connectedUser('76561199000000250');
+    $item = ownedItem($owner, 'AWP | Dragon Lore (Factory New)');
+    $post = TradePost::factory()->offering($item)->sellingFor(5000)->create();
+
+    $offerer = tradeUrlUser('76561199000000251', 1000); // not enough
+    $offer = TradeOffer::factory()->on($post)->payingCash(5000)->create(['offerer_id' => $offerer->id]);
+
+    $this->actingAs($owner)
+        ->postJson(route('offers.accept', $offer))
         ->assertStatus(422)
         ->assertJsonPath('code', 'insufficient_funds');
 
-    expect($buyer->ensureWallet()->fresh()->balance)->toBe(1_000);
+    expect($post->fresh()->status)->toBe(TradePostStatus::Open)
+        ->and(Trade::count())->toBe(0);
 });
 
-test('buying from a suspended seller is rejected', function () {
-    ['seller' => $seller, 'item' => $item] = sellerWithItem();
-    $seller->forceFill(['suspended_at' => now(), 'suspension_reason' => 'test'])->save();
-    $buyer = buyerWithBalance();
+test('only a party can view a trade', function () {
+    $trade = Trade::factory()->create();
+    $stranger = User::factory()->create(['steam_id' => '76561199000000260']);
 
-    $this->actingAs($buyer)
-        ->postJson(route('trades.store'), ['inventory_item_id' => $item->id, 'price' => 2_500])
-        ->assertStatus(422)
-        ->assertJsonPath('code', 'seller_suspended');
+    $this->actingAs($stranger)->getJson(route('trades.show', $trade))->assertStatus(404);
+
+    $this->actingAs(User::find($trade->initiator_id))
+        ->getJson(route('trades.show', $trade))
+        ->assertOk()
+        ->assertJsonPath('trade.id', $trade->id);
 });
 
-test('a suspended buyer is blocked from trading by middleware', function () {
-    ['item' => $item] = sellerWithItem();
-    $buyer = buyerWithBalance();
-    $buyer->forceFill(['suspended_at' => now(), 'suspension_reason' => 'test'])->save();
+test('viewing the market feed lists open posts', function () {
+    $owner = connectedUser('76561199000000270');
+    $item = ownedItem($owner, 'AWP | Dragon Lore (Factory New)');
+    TradePost::factory()->offering($item)->sellingFor(5000)->create();
 
-    $this->actingAs($buyer)
-        ->postJson(route('trades.store'), ['inventory_item_id' => $item->id, 'price' => 2_500])
-        ->assertStatus(403)
-        ->assertJsonPath('code', 'account_suspended');
+    $viewer = tradeUrlUser('76561199000000271');
+
+    $this->actingAs($viewer)
+        ->getJson(route('posts.index'))
+        ->assertOk()
+        ->assertJsonCount(1, 'posts');
 });
 
-test('a party can view their trade but a stranger cannot', function () {
-    ['seller' => $seller, 'item' => $item] = sellerWithItem();
-    $buyer = buyerWithBalance();
-    $trade = app(TradeService::class)->open($buyer, $item, 2_500);
-
-    $this->actingAs($buyer)->getJson(route('trades.show', $trade))->assertOk()->assertJsonPath('trade.id', $trade->id);
-    $this->actingAs($seller)->getJson(route('trades.show', $trade))->assertOk();
-
-    $stranger = User::factory()->create(['steam_id' => '76561199000000099']);
-    $this->actingAs($stranger)->getJson(route('trades.show', $trade))->assertNotFound();
-});
-
-test('creating a trade requires authentication', function () {
-    ['item' => $item] = sellerWithItem();
-
-    $this->postJson(route('trades.store'), ['inventory_item_id' => $item->id, 'price' => 2_500])
-        ->assertUnauthorized();
+test('the posts endpoint requires authentication', function () {
+    $this->getJson(route('posts.index'))->assertUnauthorized();
 });

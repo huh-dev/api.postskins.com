@@ -2,10 +2,17 @@
 
 namespace App\Http\Controllers\Dev;
 
+use App\Enums\OfferItemSide;
+use App\Enums\PostItemSide;
+use App\Enums\TradeOfferStatus;
+use App\Enums\TradePostStatus;
 use App\Http\Controllers\Controller;
 use App\Http\Resources\TradeResource;
 use App\Models\InventoryItem;
 use App\Models\Trade;
+use App\Models\TradeItem;
+use App\Models\TradeOffer;
+use App\Models\TradePost;
 use App\Models\User;
 use App\Services\Steam\FakeInventoryProvider;
 use App\Services\Steam\InventoryProvider;
@@ -18,13 +25,17 @@ use Carbon\CarbonImmutable;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 
 /**
- * A LOCAL-ONLY harness that drives the full P2P trade flow through the real
+ * A LOCAL-ONLY harness that drives the full trade flow through the real
  * services. The seller is a real Steam account whose public inventory is pulled
  * via the normal inventory sync; the buyer is a simulated account whose receipt
  * and reversal are faked (a real Steam trade can't execute locally). Powers the
  * `/trade-lab` page in the frontend.
+ *
+ * Each "buy" becomes a cash-only trade post (seller offers the item, wants cash)
+ * with a single accepted offer from the buyer, executed through TradeService.
  */
 class TradeLabController extends Controller
 {
@@ -50,6 +61,7 @@ class TradeLabController extends Controller
     public function reset(): JsonResponse
     {
         Trade::query()->delete();
+        TradePost::query()->delete();
 
         $buyer = $this->seedBuyer();
         InventoryItem::where('user_id', $buyer->id)->delete();
@@ -70,14 +82,10 @@ class TradeLabController extends Controller
             'steam_id' => ['required', 'string', 'regex:/^\d{17}$/'],
         ]);
 
-        $seller = User::firstOrCreate(
+        $seller = $this->connectedSeller(
             ['steam_id' => $validated['steam_id']],
             ['name' => 'Lab Seller '.$validated['steam_id']],
         );
-
-        // Keep the lab usable across reversal tests.
-        $seller->forceFill(['suspended_at' => null, 'suspension_reason' => null])->save();
-        Cache::forever(self::SELLER_CACHE_KEY, $seller->id);
 
         $result = $this->realProvider()->fetch($seller->steam_id, 730, 2);
 
@@ -94,17 +102,37 @@ class TradeLabController extends Controller
      */
     public function demoSeller(): JsonResponse
     {
-        $seller = User::firstOrCreate(
+        $seller = $this->connectedSeller(
             ['steam_id' => '76561199000000001'],
             ['name' => 'Demo Seller'],
         );
 
-        $seller->forceFill(['suspended_at' => null, 'suspension_reason' => null])->save();
-        Cache::forever(self::SELLER_CACHE_KEY, $seller->id);
-
         $this->sync->sync($seller, 730, 2, $this->demoItems());
 
         return $this->snapshot('ok');
+    }
+
+    /**
+     * A seller who is connected for selling (a lab-only fake refresh token lets
+     * TradeService::execute treat them as able to send).
+     *
+     * @param  array<string, mixed>  $keys
+     * @param  array<string, mixed>  $values
+     */
+    private function connectedSeller(array $keys, array $values): User
+    {
+        $seller = User::firstOrCreate($keys, $values);
+
+        $seller->forceFill([
+            'suspended_at' => null,
+            'suspension_reason' => null,
+            'steam_refresh_token' => 'lab-token',
+            'steam_selling_connected_at' => now(),
+        ])->save();
+
+        Cache::forever(self::SELLER_CACHE_KEY, $seller->id);
+
+        return $seller->fresh();
     }
 
     /**
@@ -140,7 +168,7 @@ class TradeLabController extends Controller
     }
 
     /**
-     * Create the offer: the buyer buys one of the seller's synced items.
+     * Create the trade: the buyer buys one of the seller's synced items for cash.
      */
     public function buy(Request $request): JsonResponse
     {
@@ -173,20 +201,74 @@ class TradeLabController extends Controller
             return response()->json(['message' => 'The buyer\'s balance is too low for that price.'], 422);
         }
 
-        $this->trades->open($buyer, $item, $validated['price']);
+        $offer = $this->buildCashOffer($seller, $buyer, $item, $validated['price']);
+        $this->trades->execute($offer);
 
         return $this->snapshot();
     }
 
     /**
-     * Simulate the buyer receiving the item (trade-locked), then verify.
+     * Build an accepted-shaped cash offer: seller posts the item wanting cash,
+     * the buyer offers exactly that cash. Ready to hand to TradeService::execute.
+     */
+    private function buildCashOffer(User $seller, User $buyer, InventoryItem $item, int $price): TradeOffer
+    {
+        return DB::transaction(function () use ($seller, $buyer, $item, $price): TradeOffer {
+            $post = TradePost::create([
+                'owner_id' => $seller->id,
+                'app_id' => $item->app_id,
+                'context_id' => $item->context_id,
+                'want_cash' => $price,
+                'currency' => config('trades.currency'),
+                'status' => TradePostStatus::Open,
+            ]);
+
+            $post->items()->create([
+                'side' => PostItemSide::Offering,
+                'item_description_id' => $item->item_description_id,
+                'inventory_item_id' => $item->id,
+                'app_id' => $item->app_id,
+                'context_id' => $item->context_id,
+                'market_hash_name' => $item->itemDescription->market_hash_name,
+                'asset_id' => $item->asset_id,
+            ]);
+
+            $offer = $post->offers()->create([
+                'offerer_id' => $buyer->id,
+                'cash_amount' => $price,
+                'cash_payer' => TradeOffer::PAYER_OFFERER,
+                'currency' => config('trades.currency'),
+                'status' => TradeOfferStatus::Pending,
+            ]);
+
+            $offer->items()->create([
+                'side' => OfferItemSide::FromPoster,
+                'item_description_id' => $item->item_description_id,
+                'inventory_item_id' => $item->id,
+                'app_id' => $item->app_id,
+                'context_id' => $item->context_id,
+                'market_hash_name' => $item->itemDescription->market_hash_name,
+                'asset_id' => $item->asset_id,
+            ]);
+
+            return $offer;
+        });
+    }
+
+    /**
+     * Simulate the buyer receiving the item (trade-locked): the seller's asset
+     * leaves their inventory and the locked copy appears for the buyer, then verify.
      */
     public function simulateReceived(): JsonResponse
     {
         $trade = $this->currentTrade();
 
         if ($trade !== null) {
-            FakeInventoryProvider::set(self::BUYER_STEAM_ID, 'ok', [$this->receivedItemRow($trade)]);
+            foreach ($trade->items()->get() as $leg) {
+                InventoryItem::where('user_id', $leg->giver_id)->where('asset_id', $leg->asset_id_sent)->delete();
+            }
+
+            FakeInventoryProvider::set(self::BUYER_STEAM_ID, 'ok', $this->receivedRows($trade));
             $this->runVerification();
         }
 
@@ -251,29 +333,32 @@ class TradeLabController extends Controller
     }
 
     /**
-     * The normalized inventory row for a received, trade-locked copy of the item.
+     * Normalized inventory rows for the buyer's received, trade-locked copies.
      *
-     * @return array<string, mixed>
+     * @return array<int, array<string, mixed>>
      */
-    private function receivedItemRow(Trade $trade): array
+    private function receivedRows(Trade $trade): array
     {
-        $description = $trade->itemDescription;
+        return $trade->items()->with('itemDescription')->get()
+            ->map(function (TradeItem $leg): array {
+                $description = $leg->itemDescription;
 
-        return [
-            'asset_id' => 'received-'.$trade->id,
-            'class_id' => $description->classid,
-            'instance_id' => $description->instanceid,
-            'amount' => 1,
-            'name' => $description->name,
-            'market_name' => $description->market_name,
-            'market_hash_name' => $description->market_hash_name,
-            'type' => $description->type,
-            'tradable' => false,
-            'tradable_after' => CarbonImmutable::now()->addDays((int) config('trades.protection_hold_days')),
-            'trade_hold_days' => $description->trade_hold_days,
-            'marketable' => (bool) $description->marketable,
-            'icon_url' => $description->icon_url,
-        ];
+                return [
+                    'asset_id' => 'received-'.$leg->id,
+                    'class_id' => $description->classid,
+                    'instance_id' => $description->instanceid,
+                    'amount' => 1,
+                    'name' => $description->name,
+                    'market_name' => $description->market_name,
+                    'market_hash_name' => $description->market_hash_name,
+                    'type' => $description->type,
+                    'tradable' => false,
+                    'tradable_after' => CarbonImmutable::now()->addDays((int) config('trades.protection_hold_days')),
+                    'trade_hold_days' => $description->trade_hold_days,
+                    'marketable' => (bool) $description->marketable,
+                    'icon_url' => $description->icon_url,
+                ];
+            })->all();
     }
 
     private function seedBuyer(): User
@@ -311,7 +396,7 @@ class TradeLabController extends Controller
     }
 
     /**
-     * The seller's synced items, offerable as listings.
+     * The seller's synced items, offerable in the lab.
      *
      * @return array<int, array<string, mixed>>
      */
@@ -344,7 +429,7 @@ class TradeLabController extends Controller
         $seller = $this->seller();
         $buyer = $this->buyer();
         $trade = $this->currentTrade();
-        $trade?->load(['seller', 'buyer', 'itemDescription', 'events']);
+        $trade?->load(['initiator', 'counterparty', 'items.itemDescription', 'events']);
 
         return response()->json([
             'seller' => $this->userState($seller),

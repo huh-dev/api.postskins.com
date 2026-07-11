@@ -1,0 +1,38 @@
+<?php
+
+namespace App\Http\Resources;
+
+use App\Http\Resources\Concerns\ResolvesSteamIcon;
+use App\Models\TradePostItem;
+use Illuminate\Http\Request;
+use Illuminate\Http\Resources\Json\JsonResource;
+
+/**
+ * @mixin TradePostItem
+ */
+class TradePostItemResource extends JsonResource
+{
+    use ResolvesSteamIcon;
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function toArray(Request $request): array
+    {
+        $description = $this->itemDescription;
+
+        return [
+            'id' => $this->id,
+            'side' => $this->side->value,
+            'market_hash_name' => $this->market_hash_name,
+            'asset_id' => $this->asset_id,
+            'quantity' => $this->quantity,
+            'item' => [
+                'name' => $description?->name,
+                'market_hash_name' => $description?->market_hash_name,
+                'type' => $description?->type,
+                'icon_url' => $this->resolveIconUrl($description?->icon_url),
+            ],
+        ];
+    }
+}

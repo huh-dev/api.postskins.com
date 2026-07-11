@@ -5,7 +5,7 @@ namespace App\Console\Commands;
 use App\Enums\TradeStatus;
 use App\Jobs\CheckTradeOffer;
 use App\Jobs\VerifyAcceptedTrade;
-use App\Jobs\VerifyBuyerInventory;
+use App\Jobs\VerifyTradeInventories;
 use App\Models\Trade;
 use Illuminate\Console\Command;
 
@@ -13,8 +13,8 @@ use Illuminate\Console\Command;
  * Every minute, advances active trades:
  *  - pending delivery WITH a sent offer -> confirm delivery via the offer state.
  *  - accepted WITH a sent offer -> watch for a rollback via the PUBLIC
- *    inventories (no seller session, so a reversing seller can't hide it).
- *  - anything without an offer id (e.g. the lab) -> buyer-inventory checks.
+ *    inventories (no session, so a reversing party can't hide it).
+ *  - anything without an offer id (e.g. the lab) -> inventory checks.
  */
 class PollTrades extends Command
 {
@@ -29,11 +29,11 @@ class PollTrades extends Command
         $trades = Trade::query()
             ->whereIn('status', [TradeStatus::PendingDelivery, TradeStatus::Accepted])
             ->where($due)
-            ->get(['id', 'status', 'buyer_id', 'steam_tradeoffer_id']);
+            ->get(['id', 'status', 'steam_tradeoffer_id']);
 
         $offerChecks = 0;
         $reversalChecks = 0;
-        $inventoryBuyers = [];
+        $inventoryChecks = 0;
 
         foreach ($trades as $trade) {
             if ($trade->steam_tradeoffer_id !== null) {
@@ -48,15 +48,12 @@ class PollTrades extends Command
                 continue;
             }
 
-            // No offer to track (lab / manual) -> fall back to buyer inventory.
-            $inventoryBuyers[$trade->buyer_id] = true;
+            // No offer to track (lab / manual) -> fall back to inventory reads.
+            VerifyTradeInventories::dispatch($trade->id);
+            $inventoryChecks++;
         }
 
-        foreach (array_keys($inventoryBuyers) as $buyerId) {
-            VerifyBuyerInventory::dispatch($buyerId);
-        }
-
-        $this->info("Dispatched {$offerChecks} delivery, {$reversalChecks} reversal, ".count($inventoryBuyers).' inventory check(s).');
+        $this->info("Dispatched {$offerChecks} delivery, {$reversalChecks} reversal, {$inventoryChecks} inventory check(s).");
 
         return self::SUCCESS;
     }

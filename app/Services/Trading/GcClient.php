@@ -33,18 +33,21 @@ class GcClient
     }
 
     /**
-     * Send a trade offer from the seller (via their refresh token) to a buyer.
+     * Send one atomic trade offer from the sender (via their refresh token) to
+     * the partner's trade URL, giving `$myItems` and requesting `$theirItems`.
      *
-     * @param  array{appid: int, contextid: string, assetid: string}  $item
+     * @param  list<array{appid: int, contextid: string, assetid: string}>  $myItems
+     * @param  list<array{appid: int, contextid: string, assetid: string}>  $theirItems
      * @return array<string, mixed>
      */
-    public function sendOffer(string $refreshToken, string $tradeUrl, array $item, ?string $message = null): array
+    public function sendOffer(string $refreshToken, string $tradeUrl, array $myItems, array $theirItems, ?string $message = null): array
     {
         return $this->request()
             ->post($this->url('/trade/send-offer'), [
                 'refresh_token' => $refreshToken,
                 'trade_url' => $tradeUrl,
-                'item' => $item,
+                'my_items' => array_values($myItems),
+                'their_items' => array_values($theirItems),
                 'message' => $message,
             ])
             ->throw()

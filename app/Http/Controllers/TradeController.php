@@ -2,57 +2,27 @@
 
 namespace App\Http\Controllers;
 
-use App\Exceptions\InsufficientFundsException;
 use App\Http\Resources\TradeResource;
-use App\Models\InventoryItem;
 use App\Models\Trade;
-use App\Services\Trading\TradeService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 class TradeController extends Controller
 {
-    public function __construct(private readonly TradeService $trades) {}
-
     /**
-     * Buy a listed item: create the trade and hold the buyer's payment.
+     * The authenticated user's trades, as either party, most recent first.
      */
-    public function store(Request $request): JsonResponse
+    public function mine(Request $request): JsonResponse
     {
-        $validated = $request->validate([
-            'inventory_item_id' => ['required', 'integer', 'exists:inventory_items,id'],
-            'price' => ['required', 'integer', 'min:1'],
-        ]);
+        $userId = $request->user()->id;
 
-        $buyer = $request->user();
-        $item = InventoryItem::with(['itemDescription', 'user'])->findOrFail($validated['inventory_item_id']);
-        $seller = $item->user;
+        $trades = Trade::query()
+            ->with(['initiator', 'counterparty', 'items.itemDescription'])
+            ->where(fn ($q) => $q->where('initiator_id', $userId)->orWhere('counterparty_id', $userId))
+            ->latest('id')
+            ->get();
 
-        if ($seller->id === $buyer->id) {
-            return response()->json(['message' => 'You cannot buy your own item.', 'code' => 'own_item'], 422);
-        }
-
-        if ($seller->isSuspended()) {
-            return response()->json(['message' => 'The seller is suspended.', 'code' => 'seller_suspended'], 422);
-        }
-
-        if (! $buyer->trade_url) {
-            return response()->json([
-                'message' => 'Add your Steam trade URL before buying.',
-                'code' => 'trade_url_required',
-            ], 422);
-        }
-
-        try {
-            $trade = $this->trades->open($buyer, $item, $validated['price']);
-        } catch (InsufficientFundsException) {
-            return response()->json([
-                'message' => 'Your balance is too low for this purchase.',
-                'code' => 'insufficient_funds',
-            ], 422);
-        }
-
-        return $this->tradeResponse($trade, 201);
+        return response()->json(['trades' => TradeResource::collection($trades)]);
     }
 
     /**
@@ -60,17 +30,12 @@ class TradeController extends Controller
      */
     public function show(Request $request, Trade $trade): JsonResponse
     {
-        if (! in_array($request->user()->id, [$trade->buyer_id, $trade->seller_id], true)) {
+        if (! in_array($request->user()->id, [$trade->initiator_id, $trade->counterparty_id], true)) {
             return response()->json(['message' => 'Not found.'], 404);
         }
 
-        return $this->tradeResponse($trade);
-    }
+        $trade->load(['initiator', 'counterparty', 'items.itemDescription', 'events']);
 
-    private function tradeResponse(Trade $trade, int $status = 200): JsonResponse
-    {
-        $trade->load(['seller', 'buyer', 'itemDescription', 'events']);
-
-        return response()->json(['trade' => new TradeResource($trade)], $status);
+        return response()->json(['trade' => new TradeResource($trade)]);
     }
 }

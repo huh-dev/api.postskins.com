@@ -34,18 +34,18 @@ class CheckTradeOffer implements ShouldQueue
 
     public function handle(GcClient $gc, TradeVerifier $verifier): void
     {
-        $trade = Trade::with('seller')->find($this->tradeId);
+        $trade = Trade::with('initiator')->find($this->tradeId);
 
         if ($trade === null || $trade->status !== TradeStatus::PendingDelivery) {
             return;
         }
 
-        if ($trade->steam_tradeoffer_id === null || ! $trade->seller->isSellingConnected()) {
+        if ($trade->steam_tradeoffer_id === null || ! $trade->initiator->isSellingConnected()) {
             return;
         }
 
         try {
-            $state = $gc->offerState($trade->seller->steam_refresh_token, $trade->steam_tradeoffer_id);
+            $state = $gc->offerState($trade->initiator->steam_refresh_token, $trade->steam_tradeoffer_id);
         } catch (RequestException|ConnectionException $e) {
             Log::warning('CheckTradeOffer: offer-state lookup failed', ['trade_id' => $trade->id, 'message' => $e->getMessage()]);
 

@@ -5,55 +5,57 @@ use App\Jobs\SendTradeOffer;
 use App\Models\Trade;
 use App\Models\User;
 use App\Services\Trading\GcClient;
+use App\Services\Trading\TradeVerifier;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
 
 uses(RefreshDatabase::class);
 
-test('the send-offer job sends via the GC service and records the offer id', function () {
+test('the send-offer job sends both sides of the swap and records the offer id', function () {
     Http::fake(['*/trade/send-offer' => Http::response(['ok' => true, 'tradeOfferId' => '55443322', 'state' => 'needs_confirmation'])]);
 
-    $seller = User::factory()->create([
-        'steam_id' => '76561199000000100',
-        'steam_refresh_token' => 'a-real-looking-token',
-        'steam_selling_connected_at' => now(),
-    ]);
-    $buyer = User::factory()->create([
-        'steam_id' => '76561199000000101',
-        'trade_url' => 'https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc',
-    ]);
-    $trade = Trade::factory()->create([
-        'seller_id' => $seller->id,
-        'buyer_id' => $buyer->id,
-        'status' => TradeStatus::PendingDelivery,
-        'asset_id_listed' => '7788',
-    ]);
+    $initiator = connectedUser('76561199000000100');
+    $counterparty = tradeUrlUser('76561199000000101');
+    $initiatorItem = ownedItem($initiator, 'AWP | Dragon Lore (Factory New)');
+    $counterpartyItem = ownedItem($counterparty, 'M4A4 | Howl (Minimal Wear)');
 
-    (new SendTradeOffer($trade->id))->handle(app(GcClient::class));
+    $trade = Trade::factory()
+        ->between($initiator, $counterparty)
+        ->fromInitiator($initiatorItem)
+        ->fromCounterparty($counterpartyItem)
+        ->create(['status' => TradeStatus::PendingDelivery]);
+
+    (new SendTradeOffer($trade->id))->handle(app(GcClient::class), app(TradeVerifier::class));
 
     expect($trade->fresh()->steam_tradeoffer_id)->toBe('55443322')
         ->and($trade->events()->where('type', 'offer_sent')->exists())->toBeTrue();
 
-    // The GC request carried the seller token, buyer trade URL, and the item.
-    Http::assertSent(function ($request) use ($buyer) {
+    // The GC request carried the initiator token, counterparty trade URL, and both item lists.
+    Http::assertSent(function ($request) use ($counterparty, $initiatorItem, $counterpartyItem) {
         return str_ends_with($request->url(), '/trade/send-offer')
-            && $request['refresh_token'] === 'a-real-looking-token'
-            && $request['trade_url'] === $buyer->trade_url
-            && $request['item']['assetid'] === '7788'
+            && $request['refresh_token'] === 'token-76561199000000100'
+            && $request['trade_url'] === $counterparty->trade_url
+            && collect($request['my_items'])->pluck('assetid')->contains($initiatorItem->asset_id)
+            && collect($request['their_items'])->pluck('assetid')->contains($counterpartyItem->asset_id)
             && $request->hasHeader('x-gc-secret');
     });
 });
 
-test('the send-offer job does nothing when the seller is not connected', function () {
-    $seller = User::factory()->create(['steam_id' => '76561199000000102', 'steam_refresh_token' => null]);
-    $buyer = User::factory()->create(['steam_id' => '76561199000000103', 'trade_url' => 'https://steamcommunity.com/tradeoffer/new/?partner=1&token=abc']);
-    $trade = Trade::factory()->create(['seller_id' => $seller->id, 'buyer_id' => $buyer->id, 'status' => TradeStatus::PendingDelivery]);
+test('the send-offer job cancels the trade when the initiator is not connected', function () {
+    $initiator = User::factory()->create(['steam_id' => '76561199000000102']);
+    $counterparty = tradeUrlUser('76561199000000103');
+    $item = ownedItem($initiator, 'AWP | Dragon Lore (Factory New)');
+
+    $trade = Trade::factory()
+        ->between($initiator, $counterparty)
+        ->fromInitiator($item)
+        ->create(['status' => TradeStatus::PendingDelivery]);
 
     Http::fake();
-    (new SendTradeOffer($trade->id))->handle(app(GcClient::class));
+    (new SendTradeOffer($trade->id))->handle(app(GcClient::class), app(TradeVerifier::class));
 
     Http::assertNothingSent();
-    expect($trade->fresh()->steam_tradeoffer_id)->toBeNull()
+    expect($trade->fresh()->status)->toBe(TradeStatus::Cancelled)
         ->and($trade->events()->where('type', 'offer_send_failed')->exists())->toBeTrue();
 });
 

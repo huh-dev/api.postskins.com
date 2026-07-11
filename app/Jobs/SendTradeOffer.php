@@ -2,8 +2,11 @@
 
 namespace App\Jobs;
 
+use App\Enums\TradeItemSide;
 use App\Models\Trade;
+use App\Models\TradeItem;
 use App\Services\Trading\GcClient;
+use App\Services\Trading\TradeVerifier;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Http\Client\ConnectionException;
@@ -13,9 +16,14 @@ use Illuminate\Support\Facades\Log;
 use Throwable;
 
 /**
- * Sends the seller's item to the buyer automatically via the GC service. The
- * seller then only has to confirm the outgoing offer on their mobile
- * authenticator; the poller detects the item's arrival from there.
+ * Sends one atomic Steam offer carrying both parties' items, from the initiator
+ * (the post owner) to the counterparty's trade URL. The initiator confirms the
+ * outgoing offer on their mobile authenticator; the counterparty accepts it,
+ * moving every leg at once. The poller takes over from there.
+ *
+ * A 4xx from the GC service means the request itself is bad — typically an item
+ * that moved or became untradable since the offer was accepted. That is terminal:
+ * we refund any cash and cancel, rather than retrying a send that can never work.
  */
 class SendTradeOffer implements ShouldQueue
 {
@@ -25,9 +33,9 @@ class SendTradeOffer implements ShouldQueue
 
     public function __construct(public int $tradeId) {}
 
-    public function handle(GcClient $gc): void
+    public function handle(GcClient $gc, TradeVerifier $verifier): void
     {
-        $trade = Trade::with(['seller', 'buyer'])->find($this->tradeId);
+        $trade = Trade::with(['initiator', 'counterparty', 'items'])->find($this->tradeId);
 
         if ($trade === null) {
             Log::warning('SendTradeOffer: trade not found', ['trade_id' => $this->tradeId]);
@@ -41,44 +49,58 @@ class SendTradeOffer implements ShouldQueue
             return;
         }
 
-        $seller = $trade->seller;
-        $buyer = $trade->buyer;
+        $initiator = $trade->initiator;
+        $counterparty = $trade->counterparty;
+
+        if (! $initiator->isSellingConnected()) {
+            Log::warning('SendTradeOffer: initiator not connected — no offer sent', ['trade_id' => $trade->id, 'initiator_id' => $initiator->id]);
+            $trade->recordEvent('offer_send_failed', ['reason' => 'initiator_not_connected']);
+            $verifier->cancelDelivery($trade, 'initiator_not_connected');
+
+            return;
+        }
+
+        if (! $counterparty->trade_url) {
+            Log::warning('SendTradeOffer: counterparty has no trade URL — no offer sent', ['trade_id' => $trade->id, 'counterparty_id' => $counterparty->id]);
+            $trade->recordEvent('offer_send_failed', ['reason' => 'counterparty_no_trade_url']);
+            $verifier->cancelDelivery($trade, 'counterparty_no_trade_url');
+
+            return;
+        }
+
+        $myItems = $this->assetPayload($trade, TradeItemSide::FromInitiator);
+        $theirItems = $this->assetPayload($trade, TradeItemSide::FromCounterparty);
 
         Log::info('SendTradeOffer: starting', [
             'trade_id' => $trade->id,
-            'seller_connected' => $seller->isSellingConnected(),
-            'buyer_has_trade_url' => (bool) $buyer->trade_url,
-            'asset_id' => $trade->asset_id_listed,
+            'my_items' => count($myItems),
+            'their_items' => count($theirItems),
         ]);
-
-        if (! $seller->isSellingConnected()) {
-            Log::warning('SendTradeOffer: seller not connected for selling — no offer sent', ['trade_id' => $trade->id, 'seller_id' => $seller->id]);
-            $trade->recordEvent('offer_send_failed', ['reason' => 'seller_not_connected']);
-
-            return;
-        }
-
-        if (! $buyer->trade_url) {
-            Log::warning('SendTradeOffer: buyer has no trade URL — no offer sent', ['trade_id' => $trade->id, 'buyer_id' => $buyer->id]);
-            $trade->recordEvent('offer_send_failed', ['reason' => 'buyer_no_trade_url']);
-
-            return;
-        }
 
         try {
             $result = $gc->sendOffer(
-                $seller->steam_refresh_token,
-                $buyer->trade_url,
-                ['appid' => $trade->app_id, 'contextid' => (string) $trade->context_id, 'assetid' => $trade->asset_id_listed],
-                "Postskins order #{$trade->id}",
+                $initiator->steam_refresh_token,
+                $counterparty->trade_url,
+                $myItems,
+                $theirItems,
+                "Postskins trade #{$trade->id}",
             );
         } catch (RequestException $e) {
-            // The GC service reached Steam but the send failed — capture why.
             $reason = $e->response->json('error') ?? $e->getMessage();
+
+            // A bad request (invalid/moved items) can never succeed on retry.
+            if ($e->response->clientError()) {
+                Log::error('SendTradeOffer: GC rejected the offer, cancelling', ['trade_id' => $trade->id, 'status' => $e->response->status(), 'reason' => $reason]);
+                $trade->recordEvent('offer_send_failed', ['reason' => $reason, 'terminal' => true]);
+                $verifier->cancelDelivery($trade, 'offer_rejected');
+
+                return;
+            }
+
             Log::error('SendTradeOffer: GC send failed', ['trade_id' => $trade->id, 'status' => $e->response->status(), 'reason' => $reason]);
             $trade->recordEvent('offer_send_failed', ['reason' => $reason]);
 
-            throw $e; // allow retry/backoff
+            throw $e; // upstream/server error — allow retry/backoff
         } catch (ConnectionException $e) {
             Log::error('SendTradeOffer: GC unreachable', ['trade_id' => $trade->id, 'gc_url' => config('services.gc.url'), 'message' => $e->getMessage()]);
             $trade->recordEvent('offer_send_failed', ['reason' => 'gc_unreachable']);
@@ -100,6 +122,24 @@ class SendTradeOffer implements ShouldQueue
     }
 
     /**
+     * The Steam asset payload for one side of the trade.
+     *
+     * @return list<array{appid: int, contextid: string, assetid: string}>
+     */
+    private function assetPayload(Trade $trade, TradeItemSide $side): array
+    {
+        return $trade->items
+            ->where('side', $side)
+            ->map(fn (TradeItem $leg): array => [
+                'appid' => (int) $leg->app_id,
+                'contextid' => (string) $leg->context_id,
+                'assetid' => $leg->asset_id_sent,
+            ])
+            ->values()
+            ->all();
+    }
+
+    /**
      * Back off when the GC service is flaky rather than burning retries.
      *
      * @return array<int, object>
@@ -112,6 +152,16 @@ class SendTradeOffer implements ShouldQueue
     public function failed(Throwable $exception): void
     {
         Log::error('SendTradeOffer: permanently failed', ['trade_id' => $this->tradeId, 'message' => $exception->getMessage()]);
-        Trade::find($this->tradeId)?->recordEvent('offer_send_failed', ['reason' => $exception->getMessage()]);
+
+        $trade = Trade::find($this->tradeId);
+
+        if ($trade === null) {
+            return;
+        }
+
+        $trade->recordEvent('offer_send_failed', ['reason' => $exception->getMessage(), 'permanent' => true]);
+
+        // Never leave the payer's cash held on a send that can no longer complete.
+        app(TradeVerifier::class)->cancelDelivery($trade, 'offer_send_failed');
     }
 }

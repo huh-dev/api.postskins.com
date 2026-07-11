@@ -1,12 +1,14 @@
 <?php
 
+use App\Http\Controllers\CatalogController;
 use App\Http\Controllers\Dev\DevWalletController;
 use App\Http\Controllers\Dev\TradeLabController;
 use App\Http\Controllers\InventoryController;
-use App\Http\Controllers\ListingController;
 use App\Http\Controllers\ProfileController;
 use App\Http\Controllers\SellerController;
 use App\Http\Controllers\TradeController;
+use App\Http\Controllers\TradeOfferController;
+use App\Http\Controllers\TradePostController;
 use App\Http\Controllers\WalletController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
@@ -28,22 +30,34 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/seller/connect/{id}', [SellerController::class, 'connectStatus'])->name('seller.connect.status');
     Route::delete('/seller/connect', [SellerController::class, 'disconnect'])->name('seller.disconnect');
 
-    Route::get('/listings', [ListingController::class, 'index'])->name('listings.index');
-    Route::get('/listings/mine', [ListingController::class, 'mine'])->name('listings.mine');
-    Route::post('/listings', [ListingController::class, 'store'])
-        ->middleware('not.suspended')
-        ->name('listings.store');
-    Route::delete('/listings/{listing}', [ListingController::class, 'destroy'])->name('listings.destroy');
-    Route::post('/listings/{listing}/purchase', [ListingController::class, 'purchase'])
-        ->middleware('not.suspended')
-        ->name('listings.purchase');
+    Route::get('/catalog/items', [CatalogController::class, 'items'])->name('catalog.items');
 
-    Route::post('/trades', [TradeController::class, 'store'])
+    // Trade posts: the market feed and a user's own posts.
+    Route::get('/posts', [TradePostController::class, 'index'])->name('posts.index');
+    Route::get('/posts/mine', [TradePostController::class, 'mine'])->name('posts.mine');
+    Route::get('/posts/{post}', [TradePostController::class, 'show'])->name('posts.show');
+    Route::post('/posts', [TradePostController::class, 'store'])
         ->middleware('not.suspended')
-        ->name('trades.store');
+        ->name('posts.store');
+    Route::delete('/posts/{post}', [TradePostController::class, 'destroy'])->name('posts.destroy');
 
-    Route::get('/trades/{trade}', [TradeController::class, 'show'])
-        ->name('trades.show');
+    // The caller's own offers, across every post, for their account page.
+    Route::get('/offers/sent', [TradeOfferController::class, 'sent'])->name('offers.sent');
+    Route::get('/offers/received', [TradeOfferController::class, 'received'])->name('offers.received');
+
+    // Counter-offers against a post.
+    Route::get('/posts/{post}/offers', [TradeOfferController::class, 'index'])->name('posts.offers.index');
+    Route::post('/posts/{post}/offers', [TradeOfferController::class, 'store'])
+        ->middleware('not.suspended')
+        ->name('posts.offers.store');
+    Route::delete('/offers/{offer}', [TradeOfferController::class, 'destroy'])->name('offers.destroy');
+    Route::post('/offers/{offer}/accept', [TradeOfferController::class, 'accept'])
+        ->middleware('not.suspended')
+        ->name('offers.accept');
+
+    // Executed trades.
+    Route::get('/trades/mine', [TradeController::class, 'mine'])->name('trades.mine');
+    Route::get('/trades/{trade}', [TradeController::class, 'show'])->name('trades.show');
 });
 
 // Local-only helpers for testing without a real deposit flow or Steam trades.
